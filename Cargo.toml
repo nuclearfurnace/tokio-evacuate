@@ -1,0 +1,9 @@
+[package]
+name = "tokio-evacuate"
+version = "0.1.0"
+authors = ["Toby Lawrence <toby@nuclearfurnace.com>"]
+edition = "2018"
+
+[dependencies]
+futures = "^0.1"
+tokio-timer = "^0.2"
