@@ -17,6 +17,18 @@
 // LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
+//! `tokio-evacuate` provides a way to safely "evacuate" users of a resource before forcefully
+//! removing them.
+//!
+//! In many networked applications, there comes a time when the server must shutdown or reload, and
+//! may still be actively serving traffic.  Listeners or publishers can be shut down, and remaining
+//! work can be processed while no new work is allowed.. but this may take longer than the operator
+//! is comfortable with.
+//!
+//! `Evacuate` is a middleware future, that works in conjuction with a classic "shutdown signal."
+//! By combining a way to track the number of current users, as well as a way to fire a global
+//! timeout, we allow applications to provide soft shutdown capabilities, giving work a chance to
+//! complete, before forcefully stopping computation.
 #[macro_use]
 extern crate futures;
 extern crate tokio_timer;
@@ -29,62 +41,57 @@ use futures::{
     prelude::*,
     sync::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
 };
-use std::{
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::time::Duration;
 use tokio_timer::{clock::now as clock_now, Delay};
 
-/// Handle to control the count of waiters for the evacuation.
+/// Dispatcher for user count updates.
 ///
-/// `Warden` is cloneable.
+/// [`Warden`] is cloneable.
 #[derive(Clone)]
 pub struct Warden {
-    count: Arc<AtomicUsize>,
-    notifier: UnboundedSender<usize>,
+    pub(crate) notify_tx: UnboundedSender<bool>,
 }
 
 /// A future for safely "evacuating" a resource that is used by multiple parties.
 ///
-/// `Evacuate` tracks a tripwire, the count of concurrent users, and a evacuation timeout.  Until
-/// the tripwire completes, `Evacuate` will always be `Async::NotReady`.  Once the tripwire is
-/// complete, a timeout is started, based on a configurable value passed in during creation.
+/// [`Evacuate`] tracks a tripwire, the count of concurrent users, and an evacuation timeout, and
+/// functions in a two-step process: we must be tripped, and then we race to the timeout.
 ///
-/// When the tripwire completes, if the user count is zero, we immediately return `Async::Ready`.
-/// Otherwise, we wait until either the user count falls to 0 or our internal timeout fires.
+/// Until the tripwire completes, [`Evacuate`] will always return `Async::NotReady`.  Once we detect
+/// that the tripwire has completed, however, we immediately spawn a timeout, based on the
+/// configured value, and race between the user count dropping to zero and the timeout firing.
 ///
-/// This allows us to build logic which safely attempts to clear users of a resource during
-/// shutdown before timing out and forcefully closing.
+/// The user count is updated by calls to [`Warden::increment`] and [`Warden::decrement`].
 pub struct Evacuate<F: Future> {
-    count: Arc<AtomicUsize>,
-    notifications: UnboundedReceiver<usize>,
+    count: u64,
+    notify_rx: UnboundedReceiver<bool>,
     tripwire: Fuse<F>,
     timeout_ms: u64,
     timeout: Delay,
 }
 
 impl Warden {
-    pub(crate) fn new(count: Arc<AtomicUsize>, notifier: UnboundedSender<usize>) -> Warden {
-        Warden { count, notifier }
-    }
+    /// Increments the user count.
+    pub fn increment(&self) { let _ = self.notify_tx.unbounded_send(true); }
 
-    pub fn increment(&self) { let _ = self.count.fetch_add(1, Ordering::SeqCst); }
-
-    pub fn decrement(&self) { let _ = self.count.fetch_sub(1, Ordering::SeqCst); }
+    /// Decrements the user count.
+    pub fn decrement(&self) { let _ = self.notify_tx.unbounded_send(false); }
 }
 
 impl<F: Future> Evacuate<F> {
+    /// Creates a new [`Evacuate`].
+    ///
+    /// The given `tripwire` is used, and the internal timeout is set to the value of `timeout_ms`.
+    ///
+    /// Returns both a [`Warden`] handle, used for incrementing and decrementing the user count, and
+    /// [`Evacuate`] itself.
     pub fn new(tripwire: F, timeout_ms: u64) -> (Warden, Evacuate<F>) {
-        let (tx, rx) = unbounded();
-        let count = Arc::new(AtomicUsize::new(0));
+        let (notify_tx, notify_rx) = unbounded();
 
-        let warden = Warden::new(count.clone(), tx);
+        let warden = Warden { notify_tx };
         let evacuate = Evacuate {
-            count,
-            notifications: rx,
+            count: 0,
+            notify_rx,
             tripwire: tripwire.fuse(),
             timeout_ms,
             timeout: Delay::new(clock_now()),
@@ -100,7 +107,13 @@ impl<F: Future> Future for Evacuate<F> {
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         // Drain the notifications queue to make sure we keep getting notified.
-        while let Ok(Async::Ready(_)) = self.notifications.poll() {}
+        while let Ok(Async::Ready(Some(state))) = self.notify_rx.poll() {
+            if state {
+                self.count += 1;
+            } else {
+                self.count -= 1;
+            }
+        }
 
         // We have to wait for our tripwire.
         if !self.tripwire.is_done() {
@@ -112,7 +125,7 @@ impl<F: Future> Future for Evacuate<F> {
 
         // We've tripped, so let's see what we're at for count.  If we're at zero, then we're done,
         // otherwise, fall through and see if we've hit our delay yet.
-        if self.count.load(Ordering::SeqCst) == 0 {
+        if self.count == 0 {
             // We've tripped and we're at count 0, so we're done.
             return Ok(Async::Ready(()));
         }
