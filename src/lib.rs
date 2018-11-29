@@ -33,7 +33,7 @@
 extern crate futures;
 extern crate tokio_timer;
 
-#[cfg(tests)]
+#[cfg(test)]
 extern crate tokio_executor;
 
 use futures::{
@@ -137,6 +137,8 @@ impl<F: Future> Future for Evacuate<F> {
 
 #[cfg(test)]
 mod tests {
+    extern crate tokio_executor;
+
     #[macro_use]
     mod support;
     use self::support::*;
